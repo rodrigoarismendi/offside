@@ -1,0 +1,14 @@
+services:
+  db:
+    image: postgres:17
+    container_name: offside_db
+    environment:
+      POSTGRES_USER: offside
+      POSTGRES_PASSWORD: offside
+      POSTGRES_DB: offside
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+volumes:
+  pgdata:
