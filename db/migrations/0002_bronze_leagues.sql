@@ -1,4 +1,4 @@
-create table if not exists raw.leagues (
+create table if not exists bronze.leagues (
     id            bigint generated always as identity primary key,  -- surrogate key for THIS raw row
     payload       jsonb        not null,                            -- one league record, exactly as returned
     source_params jsonb,                                            -- the request params (e.g. {"id": 39}) for context

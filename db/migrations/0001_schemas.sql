@@ -1,4 +1,3 @@
-create schema if not exists raw;
-create schema if not exists stg;
-create schema if not exists dv;
-create schema if not exists mart;
+create schema if not exists bronze;
+create schema if not exists silver;
+create schema if not exists gold;
