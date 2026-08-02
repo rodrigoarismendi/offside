@@ -56,28 +56,32 @@ Data flows left→right; each layer has a single responsibility. **Go only ever 
 ```mermaid
 flowchart LR
     API["API-Football v3<br/>(REST / JSON)"]
-    subgraph GO["Go — Extract + Load (thin)"]
-        C["apifootball client"] --> L["db insert helpers"]
+    subgraph GO["Go (cmd/ingest)"]
+        C["apifootball client"] --> L["bronze insert"]
+        L --> M["MergeSilver<br/>(runs embedded silver/*.sql)"]
     end
     subgraph PG["PostgreSQL 17"]
         B[("bronze<br/>raw jsonb")]
-        S[("silver<br/>typed & clean")]
+        S[("silver<br/>typed tables")]
         G[("gold<br/>star schema")]
     end
     API --> C
     L --> B
-    B -- "SQL" --> S
-    S -- "SQL" --> G
+    B -. reads .-> M
+    M -- "MERGE" --> S
+    S -- "SQL (planned)" --> G
     G --> BI["SQL analytics / BI"]
 ```
 
-| Layer      | Schema   | Responsibility                                                        | Built by |
-| ---------- | -------- | --------------------------------------------------------------------- | -------- |
-| **Bronze** | `bronze` | Land API responses **as-is** as `jsonb`, append-only (audit trail)    | Go       |
-| **Silver** | `silver` | Parse `jsonb` → typed columns, dedup, one row per business entity      | SQL      |
-| **Gold**   | `gold`   | Kimball star schema: conformed dimensions + fact tables               | SQL      |
+| Layer      | Schema   | Responsibility                                                        | Built by            |
+| ---------- | -------- | --------------------------------------------------------------------- | ------------------- |
+| **Bronze** | `bronze` | Land API responses **as-is** as `jsonb`, append-only (audit trail)    | Go (`InsertRaw`)    |
+| **Silver** | `silver` | Parse `jsonb` → typed columns, dedup, one row per business entity      | SQL `MERGE`, run by Go |
+| **Gold**   | `gold`   | Kimball star schema: conformed dimensions + fact tables               | SQL (planned)       |
 
-**Why ELT (transform in SQL, not Go):** the raw layer is immutable and replayable, so the model can be rebuilt at any time without re-calling the API (which matters under the free-tier quota). Go stays a thin, robust extractor.
+**Why ELT (transform in SQL, not Go):** the raw layer is immutable and replayable, so the model can be rebuilt at any time without re-calling the API (which matters under the free-tier quota). Go stays a thin extractor and only *orchestrates* the transforms.
+
+**How Silver is transformed:** the transform logic is a set of SQL `MERGE` (upsert) statements, one per entity, stored as `.sql` files in `internal/db/silver/` and **embedded into the binary** via `//go:embed`. After the Bronze load finishes, `db.MergeSilver` runs them **all in a single transaction**, so Silver updates atomically and idempotently — re-running the pipeline never duplicates rows (Bronze grows append-only; Silver stays one row per business key).
 
 ---
 
@@ -120,22 +124,44 @@ Every endpoint returns the same wrapper; the payload is always in the `response`
 ```
 offside/
 ├── cmd/
-│   └── ingest/            # main entry point: `go run ./cmd/ingest`
-│       └── main.go
+│   └── ingest/                    # main entry point: `go run ./cmd/ingest`
+│       └── main.go                #   config → pool → load bronze → MergeSilver
 ├── internal/
-│   ├── apifootball/       # HTTP client + envelope decoding → []json.RawMessage
-│   ├── config/            # .env → typed Config (fail-fast on missing secrets)
-│   └── db/                # pgxpool setup + raw-insert helpers
+│   ├── apifootball/
+│   │   └── client.go              # HTTP client + envelope decode → []json.RawMessage
+│   ├── config/
+│   │   └── config.go              # .env → typed Config (fail-fast on missing secrets)
+│   └── db/
+│       ├── db.go                  # pgxpool setup + Ping
+│       ├── raw.go                 # InsertRaw → bronze.* (whitelisted tables)
+│       ├── silver.go              # //go:embed silver/*.sql + MergeSilver (one tx)
+│       └── silver/                # one MERGE (upsert) per entity, embedded in binary
+│           ├── teams.sql
+│           ├── venues.sql
+│           ├── leagues.sql
+│           ├── seasons.sql
+│           ├── fixtures.sql
+│           └── standings.sql
 ├── db/
-│   └── migrations/        # numbered SQL; sort order == pipeline order
-│       ├── 0001_schemas.sql        # bronze / silver / gold
-│       ├── 0002_bronze_leagues.sql    # bronze.leagues
-│       └── 0003_bronze_teams.sql      # bronze.teams
-├── docker-compose.yml     # PostgreSQL 17
-├── .env.example           # config template (no secrets)
+│   └── migrations/                # DDL only; numbered, lexical order == pipeline order
+│       ├── 0001_schemas.sql            # bronze / silver / gold schemas
+│       ├── 0002_bronze_leagues.sql     # bronze.leagues
+│       ├── 0003_bronze_teams.sql       # bronze.teams
+│       ├── 0004_bronze_fixtures.sql    # bronze.fixtures
+│       ├── 0005_bronze_standings.sql   # bronze.standings
+│       ├── 0100_silver_teams.sql       # silver.teams
+│       ├── 0101_silver_venues.sql      # silver.venues
+│       ├── 0102_silver_leagues.sql     # silver.leagues
+│       ├── 0103_silver_seasons.sql     # silver.seasons
+│       ├── 0104_silver_fixtures.sql    # silver.fixtures
+│       └── 0105_silver_standings.sql   # silver.standings
+├── docker-compose.yml             # PostgreSQL 17
+├── .env.example                   # config template (no secrets)
 ├── go.mod / go.sum
 └── README.md
 ```
+
+> **DDL vs. transform:** `db/migrations/*.sql` create *structure* (tables), applied once via `psql`. The `internal/db/silver/*.sql` files are the *transforms* (MERGE upserts), embedded and run by Go on every pipeline run.
 
 ---
 
@@ -183,28 +209,35 @@ erDiagram
     }
 ```
 
-> Status: `bronze.leagues` and `bronze.teams` exist; `bronze.fixtures` and `bronze.standings` are planned.
+> Status: all four Bronze tables (`bronze.leagues`, `bronze.teams`, `bronze.fixtures`, `bronze.standings`) exist.
 
 ### Silver — cleaned & typed
 
-One row per business entity, keyed by the **source (natural) key**, produced by SQL over the Bronze `jsonb`. Note that some entities are extracted from **nested** structures of a single Bronze table (e.g. `venues` and `countries` fall out of `bronze.teams` / `bronze.leagues`).
+Persisted **tables**, one row per business entity, keyed by the **source (natural) key** and kept in sync by an idempotent `MERGE` over the Bronze `jsonb`. Some entities are extracted from **nested** structures of a single Bronze table (e.g. `venues` from `bronze.teams`; `seasons` explode out of the nested `seasons[]` array in `bronze.leagues`; `standings` explode from a nested array-of-arrays in `bronze.standings`).
 
 ```mermaid
 erDiagram
     silver_leagues {
         int  league_id    PK
-        text name
+        text league_name
         text type
         text country_name
         text country_code
-        text logo_url
+        text logo
+        text flag
+        timestamptz loaded_at
     }
     silver_seasons {
-        int     league_id  PK,FK
-        int     season     PK
+        int     league_id   PK,FK
+        int     year        PK
         date    start_date
         date    end_date
-        boolean is_current
+        boolean current
+        boolean odds
+        boolean players
+        boolean standings
+        boolean predictions
+        timestamptz loaded_at
     }
     silver_teams {
         int     team_id   PK
@@ -214,49 +247,67 @@ erDiagram
         int     founded
         boolean national
         text    logo_url
+        timestamptz loaded_at
     }
     silver_venues {
-        int  venue_id  PK
-        text name
+        int  team_id    PK,FK
+        int  venue_id   PK
+        text venue_name
         text city
-        int  capacity
+        text address
         text surface
+        text image
+        bigint capacity
+        timestamptz loaded_at
     }
     silver_fixtures {
         int         fixture_id     PK
         int         league_id      FK
         int         season
-        timestamptz kickoff_utc
-        text        status
+        text        round
+        timestamptz kickoff
+        text        status_short
+        int         status_elapsed
+        text        referee
+        int         venue_id       FK
         int         home_team_id   FK
         int         away_team_id   FK
-        int         venue_id       FK
+        boolean     home_winner
+        boolean     away_winner
         int         goals_home
         int         goals_away
+        int         ht_home
+        int         ht_away
+        timestamptz loaded_at
     }
     silver_standings {
-        int         league_id      PK,FK
-        int         season         PK
-        int         team_id        PK,FK
-        timestamptz snapshot_at    PK
-        int         rank
-        int         points
-        int         played
-        int         win
-        int         draw
-        int         lose
-        int         goals_for
-        int         goals_against
+        int  league_id      PK,FK
+        int  season         PK
+        int  team_id        PK,FK
+        text team_name
+        int  rank
+        int  points
+        int  goals_diff
+        text form
+        int  played
+        int  win
+        int  draw
+        int  lose
+        int  goals_for
+        int  goals_against
+        timestamptz loaded_at
     }
 
     silver_leagues   ||--o{ silver_seasons   : "has"
     silver_leagues   ||--o{ silver_fixtures  : "hosts"
     silver_teams     ||--o{ silver_fixtures  : "home"
     silver_teams     ||--o{ silver_fixtures  : "away"
-    silver_venues    ||--o{ silver_fixtures  : "at"
+    silver_teams     ||--o{ silver_venues    : "plays at"
     silver_leagues   ||--o{ silver_standings : "ranks in"
     silver_teams     ||--o{ silver_standings : "positioned"
 ```
+
+> Status: all six Silver tables built and populated (league 39 / season 2023): teams 20 · venues 20 · leagues 1 · seasons 17 · fixtures 380 · standings 20. Diagrams show representative columns — `silver.fixtures` also carries full-/extra-time and penalty score breakdowns, and `silver.seasons` carries the complete API `coverage` flag set.
 
 ### Gold — star schema (proposed target)
 
@@ -393,20 +444,24 @@ erDiagram
    docker compose ps          # expect: offside_db ... Up
    ```
 
-4. **Run migrations** (see [Database migrations](#database-migrations) for details)
+4. **Run migrations** — creates all Bronze and Silver tables (see [Database migrations](#database-migrations) for details)
 
    ```bash
-   docker exec -i offside_db psql -U offside -d offside < db/migrations/0001_schemas.sql
-   docker exec -i offside_db psql -U offside -d offside < db/migrations/0002_bronze_leagues.sql
-   docker exec -i offside_db psql -U offside -d offside < db/migrations/0003_bronze_teams.sql
+   for f in db/migrations/*.sql; do
+     docker exec -i offside_db psql -U offside -d offside < "$f"
+   done
    ```
 
-5. **Ingest**
+   > On Windows CMD (no `for`-glob), apply each `db/migrations/*.sql` file in order — see the [Database migrations](#database-migrations) section for the explicit list.
+
+5. **Ingest + transform**
 
    ```bash
    go mod tidy
    go run ./cmd/ingest
    ```
+
+   This loads Bronze from the API and then runs `MergeSilver` to upsert all Silver tables. Expected tail: `ingestion + silver merge complete ✔`.
 
 ---
 
@@ -426,29 +481,43 @@ Environment variables (loaded from `.env`, which is git-ignored):
 
 ## Database migrations
 
-Plain SQL files under `db/migrations/`, numbered so that lexical order equals pipeline order (`00xx` bronze, then silver, then gold). Apply against the running container:
+Plain **DDL** files under `db/migrations/`, numbered so that lexical order equals pipeline order (`0001` schemas, `000x` bronze, `01xx` silver). These create *structure only*; the Silver **transform** logic lives separately in `internal/db/silver/*.sql` and is run by Go (see [Ingestion](#ingestion)). Apply against the running container:
 
 ```bash
 docker exec -i offside_db psql -U offside -d offside < db/migrations/0001_schemas.sql
 docker exec -i offside_db psql -U offside -d offside < db/migrations/0002_bronze_leagues.sql
 docker exec -i offside_db psql -U offside -d offside < db/migrations/0003_bronze_teams.sql
+docker exec -i offside_db psql -U offside -d offside < db/migrations/0004_bronze_fixtures.sql
+docker exec -i offside_db psql -U offside -d offside < db/migrations/0005_bronze_standings.sql
+docker exec -i offside_db psql -U offside -d offside < db/migrations/0100_silver_teams.sql
+docker exec -i offside_db psql -U offside -d offside < db/migrations/0101_silver_venues.sql
+docker exec -i offside_db psql -U offside -d offside < db/migrations/0102_silver_leagues.sql
+docker exec -i offside_db psql -U offside -d offside < db/migrations/0103_silver_seasons.sql
+docker exec -i offside_db psql -U offside -d offside < db/migrations/0104_silver_fixtures.sql
+docker exec -i offside_db psql -U offside -d offside < db/migrations/0105_silver_standings.sql
 ```
 
 Inspect:
 
 ```bash
-docker exec -it offside_db psql -U offside -d offside -c "\dn" -c "\dt bronze.*"
+docker exec -it offside_db psql -U offside -d offside -c "\dn" -c "\dt bronze.*" -c "\dt silver.*"
 ```
 
 ---
 
 ## Ingestion
 
-The `ingest` command loads config, opens a `pgxpool` connection, calls the configured API-Football endpoints, validates the `errors` array, splits `response[]` into individual records, and inserts each as one `jsonb` row into the matching `bronze.*` table (with `source_params`, `source`, `loaded_at`, and an `md5` `record_hash`).
+The `ingest` command runs the whole pipeline:
+
+1. **Load config** and open a `pgxpool` connection.
+2. **Extract + Load (Bronze):** for each endpoint, call the API, validate the `errors` array, split `response[]` into records, and insert each as one `jsonb` row into the matching `bronze.*` table (with `source_params`, `source`, `loaded_at`, and an `md5` `record_hash`).
+3. **Transform (Silver):** `db.MergeSilver` runs every embedded `internal/db/silver/*.sql` `MERGE` in a single transaction, upserting Bronze `jsonb` into typed Silver tables.
 
 ```bash
 go run ./cmd/ingest
 ```
+
+Because Bronze is append-only and Silver is a keyed `MERGE`, the command is **idempotent** — re-running grows Bronze (audit history) but leaves Silver row counts unchanged. Scope (league, season) is set by constants in `cmd/ingest/main.go`.
 
 ---
 
@@ -457,10 +526,9 @@ go run ./cmd/ingest
 - [x] Docker PostgreSQL + Go module + config loader
 - [x] `pgxpool` connectivity
 - [x] Medallion schemas (`bronze` / `silver` / `gold`)
-- [x] Bronze tables: `leagues`, `teams`
-- [ ] Bronze tables: `fixtures`, `standings`
-- [ ] `apifootball` client + `db` insert helpers (fill Bronze)
-- [ ] Silver: JSON → typed, deduped tables
+- [x] Bronze tables: `leagues`, `teams`, `fixtures`, `standings`
+- [x] `apifootball` client + `InsertRaw` (fill Bronze)
+- [x] Silver: JSON → typed, deduped tables via Go-orchestrated `MERGE` (all 6 entities)
 - [ ] Gold: `dim_date`, dimensions, `fact_fixture`, `fact_standing`
 - [ ] Widen scope: more leagues / seasons
 
