@@ -1,0 +1,21 @@
+create table if not exists silver.seasons (
+    league_id            int,
+    year                 text,
+    start_date           date,
+    end_date             date,
+    current              boolean,
+    odds                 boolean,
+    players              boolean,
+    events               boolean,
+    lineups              boolean,
+    statistics_players   boolean,
+    statistics_fixtures  boolean,
+    injuries             boolean,
+    standings            boolean,
+    top_cards            boolean,
+    predictions          boolean,
+    top_assists          boolean,
+    top_scorers          boolean,
+    loaded_at            timestamptz,
+    primary key (league_id, year)
+);
