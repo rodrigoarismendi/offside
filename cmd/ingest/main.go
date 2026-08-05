@@ -46,12 +46,21 @@ func main() {
 		}
 	}
 
+	log.Println("bronze ingestion complete ✔")
+
 	// Bronze fully loaded → transform into Silver.
 	if err := db.MergeSilver(ctx, pool); err != nil {
 		log.Fatalf("merging silver: %v", err)
 	}
 
-	log.Println("ingestion + silver merge complete ✔")
+	log.Println("silver merge complete ✔")
+
+	// Silver fully loaded → transform into Gold.
+	if err := db.MergeGold(ctx, pool); err != nil {
+		log.Fatalf("merging gold: %v", err)
+	}
+
+	log.Println("gold merge complete ✔")
 }
 
 func ingest(ctx context.Context, client *apifootball.Client, pool *pgxpool.Pool, table, path string, params url.Values) error {

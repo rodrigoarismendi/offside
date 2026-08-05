@@ -58,7 +58,8 @@ flowchart LR
     API["API-Football v3<br/>(REST / JSON)"]
     subgraph GO["Go (cmd/ingest)"]
         C["apifootball client"] --> L["bronze insert"]
-        L --> M["MergeSilver<br/>(runs embedded silver/*.sql)"]
+        L --> M["MergeSilver<br/>(embedded silver/*.sql)"]
+        M --> GG["MergeGold<br/>(embedded gold/*.sql, SCD2)"]
     end
     subgraph PG["PostgreSQL 17"]
         B[("bronze<br/>raw jsonb")]
@@ -69,19 +70,20 @@ flowchart LR
     L --> B
     B -. reads .-> M
     M -- "MERGE" --> S
-    S -- "SQL (planned)" --> G
+    S -. reads .-> GG
+    GG -- "SCD2 load" --> G
     G --> BI["SQL analytics / BI"]
 ```
 
-| Layer      | Schema   | Responsibility                                                        | Built by            |
-| ---------- | -------- | --------------------------------------------------------------------- | ------------------- |
-| **Bronze** | `bronze` | Land API responses **as-is** as `jsonb`, append-only (audit trail)    | Go (`InsertRaw`)    |
-| **Silver** | `silver` | Parse `jsonb` → typed columns, dedup, one row per business entity      | SQL `MERGE`, run by Go |
-| **Gold**   | `gold`   | Kimball star schema: conformed dimensions + fact tables               | SQL (planned)       |
+| Layer      | Schema   | Responsibility                                                        | Built by                |
+| ---------- | -------- | --------------------------------------------------------------------- | ----------------------- |
+| **Bronze** | `bronze` | Land API responses **as-is** as `jsonb`, append-only (audit trail)    | Go (`InsertRaw`)        |
+| **Silver** | `silver` | Parse `jsonb` → typed columns, dedup, one row per business entity      | SQL `MERGE`, run by Go  |
+| **Gold**   | `gold`   | Kimball star schema: conformed dimensions (+ facts, planned)          | SQL, run by Go (`MergeGold`) |
 
 **Why ELT (transform in SQL, not Go):** the raw layer is immutable and replayable, so the model can be rebuilt at any time without re-calling the API (which matters under the free-tier quota). Go stays a thin extractor and only *orchestrates* the transforms.
 
-**How Silver is transformed:** the transform logic is a set of SQL `MERGE` (upsert) statements, one per entity, stored as `.sql` files in `internal/db/silver/` and **embedded into the binary** via `//go:embed`. After the Bronze load finishes, `db.MergeSilver` runs them **all in a single transaction**, so Silver updates atomically and idempotently — re-running the pipeline never duplicates rows (Bronze grows append-only; Silver stays one row per business key).
+**How Silver & Gold are transformed:** transform logic lives as `.sql` files, **embedded into the binary** via `//go:embed`. `db.MergeSilver` runs `internal/db/silver/*.sql` (upserts) and `db.MergeGold` runs `internal/db/gold/*.sql` (SCD2 dimension loads) — each in a **single transaction**, so every layer updates atomically and idempotently. Static dimensions (`dim_date`, `dim_league`) are seeded once in their migrations; the SCD2 dimensions (`dim_team`, `dim_venue`) are re-loaded on every run by `MergeGold`.
 
 ---
 
@@ -135,13 +137,17 @@ offside/
 │       ├── db.go                  # pgxpool setup + Ping
 │       ├── raw.go                 # InsertRaw → bronze.* (whitelisted tables)
 │       ├── silver.go              # //go:embed silver/*.sql + MergeSilver (one tx)
-│       └── silver/                # one MERGE (upsert) per entity, embedded in binary
-│           ├── teams.sql
-│           ├── venues.sql
-│           ├── leagues.sql
-│           ├── seasons.sql
-│           ├── fixtures.sql
-│           └── standings.sql
+│       ├── silver/                # one MERGE (upsert) per entity, embedded in binary
+│       │   ├── teams.sql
+│       │   ├── venues.sql
+│       │   ├── leagues.sql
+│       │   ├── seasons.sql
+│       │   ├── fixtures.sql
+│       │   └── standings.sql
+│       ├── gold.go                # //go:embed gold/*.sql + MergeGold (one tx)
+│       └── gold/                  # SCD2 dimension loads, embedded in binary
+│           ├── dim_team.sql       #   expire-then-insert (Type 2)
+│           └── dim_venue.sql      #   expire-then-insert (Type 2)
 ├── db/
 │   └── migrations/                # DDL only; numbered, lexical order == pipeline order
 │       ├── 0001_schemas.sql            # bronze / silver / gold schemas
@@ -154,14 +160,18 @@ offside/
 │       ├── 0102_silver_leagues.sql     # silver.leagues
 │       ├── 0103_silver_seasons.sql     # silver.seasons
 │       ├── 0104_silver_fixtures.sql    # silver.fixtures
-│       └── 0105_silver_standings.sql   # silver.standings
+│       ├── 0105_silver_standings.sql   # silver.standings
+│       ├── 0200_gold_dim_date.sql      # gold.dim_date   (generated seed)
+│       ├── 0201_gold_dim_league.sql    # gold.dim_league (Type 1)
+│       ├── 0202_gold_dim_team.sql      # gold.dim_team   (SCD2 table + index)
+│       └── 0203_gold_dim_venue.sql     # gold.dim_venue  (SCD2 table + index)
 ├── docker-compose.yml             # PostgreSQL 17
 ├── .env.example                   # config template (no secrets)
 ├── go.mod / go.sum
 └── README.md
 ```
 
-> **DDL vs. transform:** `db/migrations/*.sql` create *structure* (tables), applied once via `psql`. The `internal/db/silver/*.sql` files are the *transforms* (MERGE upserts), embedded and run by Go on every pipeline run.
+> **DDL vs. transform:** `db/migrations/*.sql` create *structure* (tables) and seed static dimensions, applied once via `psql`. The `internal/db/silver/*.sql` and `internal/db/gold/*.sql` files are the *transforms* (Silver upserts, Gold SCD2 loads), embedded and run by Go on every pipeline run.
 
 ---
 
