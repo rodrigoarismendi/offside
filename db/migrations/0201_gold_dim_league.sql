@@ -16,4 +16,5 @@ select
     country_name,
     country_code,
     logo
-from silver.leagues;
+from silver.leagues
+on conflict (league_id) do nothing;

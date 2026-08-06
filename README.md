@@ -16,7 +16,8 @@ The project is a hands-on study of **dimensional modeling**. Extraction and load
 - [Data model](#data-model)
   - [Bronze — raw landing](#bronze--raw-landing)
   - [Silver — cleaned & typed](#silver--cleaned--typed)
-  - [Gold — star schema (proposed target)](#gold--star-schema-proposed-target)
+  - [Gold — star schema](#gold--star-schema)
+  - [Gold — KPI marts](#gold--kpi-marts)
 - [Getting started](#getting-started)
 - [Configuration](#configuration)
 - [Database migrations](#database-migrations)
@@ -59,31 +60,33 @@ flowchart LR
     subgraph GO["Go (cmd/ingest)"]
         C["apifootball client"] --> L["bronze insert"]
         L --> M["MergeSilver<br/>(embedded silver/*.sql)"]
-        M --> GG["MergeGold<br/>(embedded gold/*.sql, SCD2)"]
+        M --> GG["MergeGold<br/>(embedded gold/*.sql:<br/>SCD2 dims → facts → aggregates)"]
     end
     subgraph PG["PostgreSQL 17"]
         B[("bronze<br/>raw jsonb")]
         S[("silver<br/>typed tables")]
-        G[("gold<br/>star schema")]
+        G[("gold<br/>star schema + KPI marts")]
     end
     API --> C
     L --> B
     B -. reads .-> M
     M -- "MERGE" --> S
     S -. reads .-> GG
-    GG -- "SCD2 load" --> G
+    GG -- "load" --> G
     G --> BI["SQL analytics / BI"]
 ```
 
-| Layer      | Schema   | Responsibility                                                        | Built by                |
-| ---------- | -------- | --------------------------------------------------------------------- | ----------------------- |
-| **Bronze** | `bronze` | Land API responses **as-is** as `jsonb`, append-only (audit trail)    | Go (`InsertRaw`)        |
-| **Silver** | `silver` | Parse `jsonb` → typed columns, dedup, one row per business entity      | SQL `MERGE`, run by Go  |
-| **Gold**   | `gold`   | Kimball star schema: conformed dimensions (+ facts, planned)          | SQL, run by Go (`MergeGold`) |
+Schema (tables) is created by a separate **`cmd/migrate`** runner; **`cmd/ingest`** then fills and transforms the data.
+
+| Layer      | Schema   | Responsibility                                                          | Built by                     |
+| ---------- | -------- | ---------------------------------------------------------------------- | ---------------------------- |
+| **Bronze** | `bronze` | Land API responses **as-is** as `jsonb`, append-only (audit trail)      | Go (`InsertRaw`)             |
+| **Silver** | `silver` | Parse `jsonb` → typed columns, dedup, one row per business entity        | SQL `MERGE`, run by Go       |
+| **Gold**   | `gold`   | Kimball star schema (dims + facts) **+ KPI aggregate marts**             | SQL, run by Go (`MergeGold`) |
 
 **Why ELT (transform in SQL, not Go):** the raw layer is immutable and replayable, so the model can be rebuilt at any time without re-calling the API (which matters under the free-tier quota). Go stays a thin extractor and only *orchestrates* the transforms.
 
-**How Silver & Gold are transformed:** transform logic lives as `.sql` files, **embedded into the binary** via `//go:embed`. `db.MergeSilver` runs `internal/db/silver/*.sql` (upserts) and `db.MergeGold` runs `internal/db/gold/*.sql` (SCD2 dimension loads) — each in a **single transaction**, so every layer updates atomically and idempotently. Static dimensions (`dim_date`, `dim_league`) are seeded once in their migrations; the SCD2 dimensions (`dim_team`, `dim_venue`) are re-loaded on every run by `MergeGold`.
+**How Silver & Gold are transformed:** transform logic lives as `.sql` files, **embedded into the binary** via `//go:embed`. `db.MergeSilver` runs `internal/db/silver/*.sql` (upserts); `db.MergeGold` runs `internal/db/gold/*.sql` in filename order — **SCD2 dimension loads → fact loads → aggregate rebuilds** — each in a **single transaction**, so every layer updates atomically and idempotently. Static dimensions (`dim_date`, `dim_league`) are seeded once in their migrations; SCD2 dimensions (`dim_team`, `dim_venue`), the facts, and the aggregates are (re)built on every run by `MergeGold`.
 
 ---
 
@@ -126,8 +129,10 @@ Every endpoint returns the same wrapper; the payload is always in the `response`
 ```
 offside/
 ├── cmd/
-│   └── ingest/                    # main entry point: `go run ./cmd/ingest`
-│       └── main.go                #   config → pool → load bronze → MergeSilver
+│   ├── migrate/                   # schema runner: `go run ./cmd/migrate`
+│   │   └── main.go                #   applies pending db/migrations/*.sql, tracks state
+│   └── ingest/                    # pipeline: `go run ./cmd/ingest`
+│       └── main.go                #   config → pool → bronze → MergeSilver → MergeGold
 ├── internal/
 │   ├── apifootball/
 │   │   └── client.go              # HTTP client + envelope decode → []json.RawMessage
@@ -145,11 +150,16 @@ offside/
 │       │   ├── fixtures.sql
 │       │   └── standings.sql
 │       ├── gold.go                # //go:embed gold/*.sql + MergeGold (one tx)
-│       └── gold/                  # SCD2 dimension loads, embedded in binary
-│           ├── dim_team.sql       #   expire-then-insert (Type 2)
-│           └── dim_venue.sql      #   expire-then-insert (Type 2)
+│       └── gold/                  # dims → facts → aggregates (numeric prefix = run order)
+│           ├── 10_dim_team.sql        #   SCD2 expire-then-insert
+│           ├── 11_dim_venue.sql       #   SCD2 expire-then-insert
+│           ├── 20_fact_fixture.sql    #   upsert, surrogate-key lookups
+│           ├── 21_fact_standing.sql   #   upsert, snapshot fact
+│           ├── 30_agg_team_season.sql #   full-refresh aggregate
+│           ├── 31_agg_league_month.sql
+│           └── 32_agg_venue_home.sql
 ├── db/
-│   └── migrations/                # DDL only; numbered, lexical order == pipeline order
+│   └── migrations/                # DDL only; numbered, lexical order == apply order
 │       ├── 0001_schemas.sql            # bronze / silver / gold schemas
 │       ├── 0002_bronze_leagues.sql     # bronze.leagues
 │       ├── 0003_bronze_teams.sql       # bronze.teams
@@ -161,17 +171,22 @@ offside/
 │       ├── 0103_silver_seasons.sql     # silver.seasons
 │       ├── 0104_silver_fixtures.sql    # silver.fixtures
 │       ├── 0105_silver_standings.sql   # silver.standings
-│       ├── 0200_gold_dim_date.sql      # gold.dim_date   (generated seed)
-│       ├── 0201_gold_dim_league.sql    # gold.dim_league (Type 1)
-│       ├── 0202_gold_dim_team.sql      # gold.dim_team   (SCD2 table + index)
-│       └── 0203_gold_dim_venue.sql     # gold.dim_venue  (SCD2 table + index)
+│       ├── 0200_gold_dim_date.sql      # gold.dim_date    (generated seed)
+│       ├── 0201_gold_dim_league.sql    # gold.dim_league  (Type 1 seed)
+│       ├── 0202_gold_dim_team.sql      # gold.dim_team    (SCD2 table + index)
+│       ├── 0203_gold_dim_venue.sql     # gold.dim_venue   (SCD2 table + index)
+│       ├── 0300_gold_fact_fixture.sql  # gold.fact_fixture
+│       ├── 0301_gold_fact_standing.sql # gold.fact_standing
+│       ├── 0400_gold_agg_team_season.sql
+│       ├── 0401_gold_agg_league_month.sql
+│       └── 0402_gold_agg_venue_home.sql
 ├── docker-compose.yml             # PostgreSQL 17
 ├── .env.example                   # config template (no secrets)
 ├── go.mod / go.sum
 └── README.md
 ```
 
-> **DDL vs. transform:** `db/migrations/*.sql` create *structure* (tables) and seed static dimensions, applied once via `psql`. The `internal/db/silver/*.sql` and `internal/db/gold/*.sql` files are the *transforms* (Silver upserts, Gold SCD2 loads), embedded and run by Go on every pipeline run.
+> **DDL vs. transform:** `db/migrations/*.sql` create *structure* (tables) and seed static dimensions — applied by `cmd/migrate`, which tracks what's been run in a `schema_migrations` table. The `internal/db/silver/*.sql` and `internal/db/gold/*.sql` files are the *transforms* (Silver upserts; Gold SCD2 loads, fact loads, aggregate rebuilds), embedded and run by `cmd/ingest` on every pipeline run.
 
 ---
 
@@ -321,7 +336,7 @@ erDiagram
 
 ### Gold — star schema
 
-**Dimensions are built; facts are the next step.** The four conformed dimensions below exist and load automatically — `dim_date` / `dim_league` are seeded in their migrations, while `dim_team` / `dim_venue` are **SCD2** and re-loaded on every run by `MergeGold`. `fact_fixture` and `fact_standing` are shown as the design target (not yet implemented).
+**Dimensions and facts are built and loading.** Four conformed dimensions plus two facts, all populated by `MergeGold` (dimensions seeded via migrations for the static ones).
 
 | Dimension    | Source                        | SCD strategy         |
 | ------------ | ----------------------------- | -------------------- |
@@ -330,17 +345,18 @@ erDiagram
 | `dim_team`   | `silver.teams`                | **Type 2** (history) |
 | `dim_venue`  | `silver.venues`               | **Type 2** (history) |
 
-| Fact (planned)  | Grain (one row = …)                                        | Type              |
-| --------------- | ---------------------------------------------------------- | ----------------- |
-| `fact_fixture`  | one match                                                  | Transaction       |
-| `fact_standing` | one team's table position, per league-season, per snapshot | Periodic snapshot |
+| Fact            | Grain (one row = …)                                        | Type              | Source            |
+| --------------- | ---------------------------------------------------------- | ----------------- | ----------------- |
+| `fact_fixture`  | one match                                                  | Transaction       | `silver.fixtures` |
+| `fact_standing` | one team's table position, per league-season, per snapshot | Periodic snapshot | `silver.standings`|
 
 **Key patterns used**
-- **Surrogate keys** (`*_key`, `generated always as identity`) on every dimension; source ids kept as natural/business keys.
+- **Surrogate keys** (`*_key`, `generated always as identity`) on every dimension; source ids kept as natural/business keys. Facts fetch surrogate keys via **lookup joins** on the natural key.
 - **SCD Type 2** on `dim_team` and `dim_venue`: `valid_from` / `valid_to` / `is_current` columns, a **partial unique index** (`… where is_current`) enforcing one current version per business key, and an **expire-then-insert** load.
 - **`dim_date`** is generated (not sourced from the API), keyed by a smart `yyyymmdd` integer.
-- **Role-playing dimension:** `dim_team` will be referenced twice by `fact_fixture` (`home_team_key`, `away_team_key`).
-- **Degenerate dimension:** `fixture_id` / `status` planned to sit directly on `fact_fixture`.
+- **Role-playing dimension:** `dim_team` is referenced twice by `fact_fixture` (`home_team_key`, `away_team_key`).
+- **Degenerate dimension:** `fixture_id` / `status` sit directly on `fact_fixture`; `fact_standing` carries `season` as a degenerate.
+- **Fact constellation:** both facts share the conformed dimensions (`dim_date`, `dim_league`, `dim_team`); they relate to each other only *through* those dimensions (drill-across), never by a fact-to-fact key.
 
 ```mermaid
 erDiagram
@@ -400,26 +416,28 @@ erDiagram
         int      home_team_key   FK "role-playing"
         int      away_team_key   FK "role-playing"
         int      venue_key       FK
-        text     status             "degenerate dim"
+        int      season             "degenerate"
+        text     status_short       "degenerate dim"
         int      goals_home         "measure"
         int      goals_away         "measure"
         int      goals_total        "measure (derived)"
         smallint result             "measure: 1 home / 0 draw / -1 away"
     }
     fact_standing {
-        int standing_key       PK "surrogate"
-        int snapshot_date_key  FK
-        int league_key         FK
-        int team_key           FK
-        int rank                  "measure"
-        int points                "measure"
-        int played                "measure"
-        int won                   "measure"
-        int drawn                 "measure"
-        int lost                  "measure"
-        int goals_for             "measure"
-        int goals_against         "measure"
-        int goal_diff             "measure"
+        int      standing_key       PK "surrogate"
+        int      snapshot_date_key  FK
+        int      league_key         FK
+        int      team_key           FK
+        int      season             "degenerate (grain)"
+        int      rank                  "measure"
+        int      points                "measure"
+        int      played                "measure"
+        smallint won                   "measure"
+        smallint draw                  "measure"
+        smallint lost                  "measure"
+        int      goals_for             "measure"
+        int      goals_against         "measure"
+        int      goal_diff             "measure"
     }
 
     dim_date   ||--o{ fact_fixture  : "date_key"
@@ -432,7 +450,19 @@ erDiagram
     dim_team   ||--o{ fact_standing : "team_key"
 ```
 
-> Status: all four **dimensions built and loaded** — `dim_date` (~5.8k days), `dim_league` (1), `dim_team` (20, SCD2), `dim_venue` (20, SCD2). `fact_fixture` and `fact_standing` are the next milestone.
+> Status: full star schema **built and loaded** (league 39 / season 2023) — dims `dim_date` (~5.8k days), `dim_league` (1), `dim_team` (20, SCD2), `dim_venue` (20, SCD2); facts `fact_fixture` (380) and `fact_standing` (20).
+
+### Gold — KPI marts
+
+Pre-computed **aggregate tables** built on top of the facts (rebuilt each run by `MergeGold`, *after* the facts). Each is a full-refresh (`truncate` + `insert`) summary at its own grain — the standard pattern for cheap, fully-derived rollups.
+
+| Aggregate            | Grain           | KPIs                                                                   | Built from                        |
+| -------------------- | --------------- | --------------------------------------------------------------------- | --------------------------------- |
+| `agg_team_season`    | team × season   | played, W/D/L, GF, GA, GD, points, points/game, clean sheets, final rank | `fact_fixture` **+** `fact_standing` |
+| `agg_league_month`   | league × month  | matches, total goals, goals/match, home-/draw-/away-win %             | `fact_fixture` + `dim_date`       |
+| `agg_venue_home`     | venue × season  | home matches, home goals, home goals/match, home wins, home-win %     | `fact_fixture` + `dim_venue`      |
+
+`agg_team_season` reconciles the two facts through their shared conformed dimensions (a **drill-across**): fixture-derived points vs. the official standings rank — a built-in data-quality check.
 
 ---
 
@@ -467,24 +497,22 @@ erDiagram
    docker compose ps          # expect: offside_db ... Up
    ```
 
-4. **Run migrations** — creates all Bronze and Silver tables (see [Database migrations](#database-migrations) for details)
+4. **Run migrations** — one command applies every `db/migrations/*.sql` (all Bronze, Silver, and Gold tables) and records what it ran:
 
    ```bash
-   for f in db/migrations/*.sql; do
-     docker exec -i offside_db psql -U offside -d offside < "$f"
-   done
+   go mod tidy
+   go run ./cmd/migrate
    ```
 
-   > On Windows CMD (no `for`-glob), apply each `db/migrations/*.sql` file in order — see the [Database migrations](#database-migrations) section for the explicit list.
+   Idempotent — re-run anytime; only unapplied migrations execute. See [Database migrations](#database-migrations) for how it works.
 
 5. **Ingest + transform**
 
    ```bash
-   go mod tidy
    go run ./cmd/ingest
    ```
 
-   This loads Bronze from the API, runs `MergeSilver` (upsert Silver), then `MergeGold` (SCD2 dimension loads). Expected tail: `gold merge complete ✔`.
+   This loads Bronze from the API, runs `MergeSilver` (upsert Silver), then `MergeGold` (SCD2 dimensions → facts → aggregates). Expected tail: `gold merge complete ✔`.
 
 ---
 
@@ -504,33 +532,25 @@ Environment variables (loaded from `.env`, which is git-ignored):
 
 ## Database migrations
 
-Plain **DDL** files under `db/migrations/`, numbered so that lexical order equals pipeline order (`0001` schemas, `000x` bronze, `01xx` silver). These create *structure only*; the Silver **transform** logic lives separately in `internal/db/silver/*.sql` and is run by Go (see [Ingestion](#ingestion)). Apply against the running container:
+Plain **DDL** files under `db/migrations/`, numbered so that lexical order equals apply order (`0001` schemas, `000x` bronze, `01xx` silver, `02xx` gold dims, `03xx` facts, `04xx` aggregates). They create *structure only* (a few also seed static dimensions); the **transform** logic lives separately in `internal/db/silver/*.sql` and `internal/db/gold/*.sql`, run by `cmd/ingest` (see [Ingestion](#ingestion)).
+
+Apply them all with the runner:
 
 ```bash
-docker exec -i offside_db psql -U offside -d offside < db/migrations/0001_schemas.sql
-docker exec -i offside_db psql -U offside -d offside < db/migrations/0002_bronze_leagues.sql
-docker exec -i offside_db psql -U offside -d offside < db/migrations/0003_bronze_teams.sql
-docker exec -i offside_db psql -U offside -d offside < db/migrations/0004_bronze_fixtures.sql
-docker exec -i offside_db psql -U offside -d offside < db/migrations/0005_bronze_standings.sql
-docker exec -i offside_db psql -U offside -d offside < db/migrations/0100_silver_teams.sql
-docker exec -i offside_db psql -U offside -d offside < db/migrations/0101_silver_venues.sql
-docker exec -i offside_db psql -U offside -d offside < db/migrations/0102_silver_leagues.sql
-docker exec -i offside_db psql -U offside -d offside < db/migrations/0103_silver_seasons.sql
-docker exec -i offside_db psql -U offside -d offside < db/migrations/0104_silver_fixtures.sql
-docker exec -i offside_db psql -U offside -d offside < db/migrations/0105_silver_standings.sql
-docker exec -i offside_db psql -U offside -d offside < db/migrations/0200_gold_dim_date.sql
-docker exec -i offside_db psql -U offside -d offside < db/migrations/0201_gold_dim_league.sql
-docker exec -i offside_db psql -U offside -d offside < db/migrations/0202_gold_dim_team.sql
-docker exec -i offside_db psql -U offside -d offside < db/migrations/0203_gold_dim_venue.sql
+go run ./cmd/migrate
 ```
 
-> `0200_gold_dim_date.sql` and `0201_gold_dim_league.sql` also **seed** their tables (generated calendar / league row); the SCD2 dimensions (`dim_team`, `dim_venue`) are created empty here and populated by `MergeGold` during ingestion.
+**How it works:** `cmd/migrate` reads every `db/migrations/*.sql` in sorted order, and for each one not yet recorded in a `schema_migrations` tracking table, executes it **and** records it in a single transaction. So a migration is either fully applied *and* logged or neither — and re-running only applies new files (`no new migrations — database up to date ✔`). This is the same model as tools like goose / golang-migrate / Flyway.
+
+> Migrations that seed data (`0200_gold_dim_date`, `0201_gold_dim_league`) use `on conflict … do nothing`, and DDL uses `create table if not exists`, so every migration is **idempotent** — required, since the runner may replay them.
 
 Inspect:
 
 ```bash
-docker exec -it offside_db psql -U offside -d offside -c "\dn" -c "\dt bronze.*" -c "\dt silver.*" -c "\dt gold.*"
+docker exec -it offside_db psql -U offside -d offside -c "\dt bronze.*" -c "\dt silver.*" -c "\dt gold.*"
 ```
+
+*(Run `cmd/migrate` from the project root — it reads `db/migrations` as a relative path.)*
 
 ---
 
@@ -541,7 +561,7 @@ The `ingest` command runs the whole pipeline:
 1. **Load config** and open a `pgxpool` connection.
 2. **Extract + Load (Bronze):** for each endpoint, call the API, validate the `errors` array, split `response[]` into records, and insert each as one `jsonb` row into the matching `bronze.*` table (with `source_params`, `source`, `loaded_at`, and an `md5` `record_hash`).
 3. **Transform (Silver):** `db.MergeSilver` runs every embedded `internal/db/silver/*.sql` `MERGE` in a single transaction, upserting Bronze `jsonb` into typed Silver tables.
-4. **Model (Gold):** `db.MergeGold` runs every embedded `internal/db/gold/*.sql` in a single transaction — the **SCD2 loads** (`dim_team`, `dim_venue`): expire changed current rows, then insert new versions.
+4. **Model (Gold):** `db.MergeGold` runs every embedded `internal/db/gold/*.sql` (in filename order) in a single transaction: **SCD2 dimension loads** (`dim_team`, `dim_venue` — expire changed rows, insert new versions) → **fact loads** (`fact_fixture`, `fact_standing` — surrogate-key lookup + upsert) → **aggregate rebuilds** (`agg_*` — `truncate` + `insert`).
 
 ```bash
 go run ./cmd/ingest
@@ -560,7 +580,10 @@ Expected tail: `gold merge complete ✔`. Because Bronze is append-only, Silver 
 - [x] `apifootball` client + `InsertRaw` (fill Bronze)
 - [x] Silver: JSON → typed, deduped tables via Go-orchestrated `MERGE` (all 6 entities)
 - [x] Gold dimensions: `dim_date` (seed), `dim_league` (Type 1), `dim_team` + `dim_venue` (SCD2), via `MergeGold`
-- [ ] Gold facts: `fact_fixture`, `fact_standing`
+- [x] Gold facts: `fact_fixture` (transaction), `fact_standing` (snapshot)
+- [x] Gold KPI marts: `agg_team_season`, `agg_league_month`, `agg_venue_home`
+- [x] `cmd/migrate` runner with `schema_migrations` tracking
+- [ ] Attendance source → `fact_fixture.attendance` (new Bronze source, key conforming)
 - [ ] Widen scope: more leagues / seasons
 
 ---
