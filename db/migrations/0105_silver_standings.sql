@@ -14,6 +14,7 @@ create table if not exists silver.standings (
     lose           int,
     goals_for      int,
     goals_against  int,
+    updated_at     timestamptz,
     loaded_at      timestamptz,
     primary key (league_id, season, team_id)
 );
